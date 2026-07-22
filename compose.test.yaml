@@ -1,0 +1,11 @@
+services:
+  test_db:
+    image: postgres
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: admin
+      POSTGRES_DB: test-app
+    ports:
+      - 8096:5432

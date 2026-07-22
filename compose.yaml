@@ -1,0 +1,17 @@
+services:
+  db:
+    image: postgres
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_USER: admin
+      POSTGRES_DB: app
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - app-data:/var/lib/postgresql/data
+    ports:
+      - 8095:5432
+
+volumes:
+  app-data:
