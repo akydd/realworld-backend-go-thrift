@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
 
 	pb "realworld-backend-go/api/proto/gen/pb"
 	igrpc "realworld-backend-go/internal/adapters/in/grpc"
+	ithrift "realworld-backend-go/internal/adapters/in/thrift"
 	"realworld-backend-go/internal/adapters/in/webserver"
 	"realworld-backend-go/internal/adapters/out/db"
 	"realworld-backend-go/internal/domain"
@@ -84,7 +86,8 @@ func main() {
 	}
 
 	// creds for mTLS
-	creds := setupTLSCreds()
+	tlsConfig := createTlsConfig()
+	creds := setupTLSCreds(tlsConfig)
 
 	grpcServer := grpc.NewServer(
 		grpc.Creds(creds),
@@ -114,10 +117,31 @@ func main() {
 		}
 	}()
 
+	// Thrift http server!
+	thriftPort := os.Getenv("THRIFT_HTTP_PORT")
+	thriftAddr := fmt.Sprintf("localhost:%s", thriftPort)
+
+	userThriftService := ithrift.NewUserServer(userController)
+	thriftServer, err := ithrift.NewThriftServer(thriftAddr, userThriftService, tlsConfig)
+	if err != nil {
+		log.Fatalf("failed to create Thrift http server: %v", err)
+	}
+	go func() {
+		log.Printf("starting Thrift server on port %s...", thriftPort)
+		if err = thriftServer.Server.Serve(); err != nil {
+			log.Fatalf("Thrift server failed: %v", err)
+		}
+	}()
+
 	s.Start()
 }
 
-func setupTLSCreds() credentials.TransportCredentials {
+func setupTLSCreds(cfg *tls.Config) credentials.TransportCredentials {
+	creds := credentials.NewTLS(cfg)
+	return creds
+}
+
+func createTlsConfig() *tls.Config {
 	certPEM, err := os.ReadFile(os.Getenv("GRPC_TLS_CERT"))
 	if err != nil {
 		log.Fatalf("error loading cert PEM: %v", err)
@@ -149,6 +173,5 @@ func setupTLSCreds() credentials.TransportCredentials {
 		ClientCAs:    certPool,
 		MinVersion:   tls.VersionTLS13,
 	}
-	creds := credentials.NewTLS(&tlsConfig)
-	return creds
+	return &tlsConfig
 }

@@ -1,4 +1,4 @@
-.PHONY: int-tests int-tests-grpc lint start proto dev
+.PHONY: int-tests int-tests-grpc lint start proto thrift dev thrift-py
 
 start:
 	docker compose up -d
@@ -13,6 +13,16 @@ dev:
 
 proto:
 	buf generate
+
+thrift:
+	mkdir -p api/thrift/gen
+	thrift --gen go -out api/thrift/gen api/thrift/user.thrift
+	rm -rf api/thrift/gen/thriftpb/user_service-remote
+
+thrift-py:
+	mkdir -p clients/python/gen
+	thrift --gen py -out clients/python/gen api/thrift/user.thrift
+	rm -f clients/python/gen/thriftpb/UserService-remote
 
 lint:
 	golangci-lint run ./...

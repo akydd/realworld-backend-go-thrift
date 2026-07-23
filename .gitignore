@@ -19,3 +19,7 @@ server
 certs/*.key
 certs/*.csr
 certs/ca.srl
+# Python
+__pycache__/
+*.pyc
+.venv/
