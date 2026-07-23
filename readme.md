@@ -4,13 +4,15 @@
 
 A [RealWorld](https://github.com/gothinkster/realworld) spec-compliant backend API for a social blogging platform (think Medium.com). Users can register, publish articles, follow each other, comment, and favorite posts.
 
-**Stack:** Go · gRPC · PostgreSQL · Docker · AWS ECS Fargate · RDS · ALB · Terraform · GitHub Actions
+**Stack:** Go · gRPC · Thrift · PostgreSQL · Docker · AWS ECS Fargate · RDS · ALB · Terraform · GitHub Actions
 
 ## Key Design Decisions
 
 **Hexagonal Architecture (Ports & Adapters)** — business logic in `internal/domain/` has zero framework dependencies. The HTTP layer and PostgreSQL adapter are fully interchangeable without touching domain code. This makes the codebase easy to test, extend, and reason about.
 
 **Native gRPC alongside HTTP** — the server exposes both a Gorilla Mux HTTP API (spec-compliant with the RealWorld spec) and a native gRPC API, both backed by the same domain layer. See the [gRPC API](#grpc-api) section for the reasoning behind running them as separate servers rather than using grpc-gateway.
+
+**Apache Thrift RPC (scoped demonstration)** — a third inbound adapter exposes a single Thrift endpoint (`registerUser`) plus a matching Python client. It is intentionally *not* a full API — the HTTP and gRPC adapters already cover every resource — but a focused, end-to-end slice implemented to demonstrate working knowledge of Thrift: IDL design with a declared exception, code generation, a deliberate transport/protocol choice, mTLS, and cross-language interop. See the [Thrift API](#thrift-api) section.
 
 **AWS ECS Fargate over EC2** — no servers to manage or patch. Tasks run across two private subnets (one per AZ) behind an ALB for high availability and zero-downtime rolling deploys. Application Auto Scaling adjusts the task count between 2 and 4 based on CPU utilization, keeping costs low under normal load while handling traffic spikes automatically.
 
@@ -123,6 +125,27 @@ The mapping lives in `internal/adapters/in/grpc/errors.go`. All four handler fil
 - **`UpdateUser` — bio and image use a `NullableString` wrapper.** `optional string` cannot represent the three states needed (absent = leave unchanged, null = clear, value = set). Both fields use `optional NullableString` instead: omit the field to leave it unchanged, send `bio: {}` to clear it to null, or send `bio: { value: "hello" }` to set a value.
 - **`UpdateArticle` — tag list uses a `TagListValue` wrapper.** `repeated string` cannot distinguish absent from empty. The field uses `optional TagListValue` instead: omit to leave tags unchanged, send `tag_list: {}` to clear them, or send `tag_list: { tags: ["go"] }` to replace them.
 
+## Thrift API
+
+The server exposes a third inbound adapter using **Apache Thrift**, on the port set by `THRIFT_PORT` (production default: **8100**, test environment: **8101**). It shares the same domain layer as the HTTP and gRPC adapters, so there is no business logic duplication.
+
+**Scope — a deliberate, focused demonstration.** Only a single endpoint (`registerUser`) and a matching Python client are implemented. This is intentional: the RealWorld API is already fully served by the HTTP adapter (spec-compliant) and the gRPC adapter, so re-implementing every resource in Thrift would add maintenance cost without demonstrating anything new. Instead, this adapter is a complete end-to-end vertical slice that exercises the parts of Thrift that matter — IDL design, a declared exception, code generation, transport/protocol selection, mTLS, and cross-language interop — to show working knowledge of the technology.
+
+The service is defined in `api/thrift/user.thrift`; generated Go stubs are committed to `api/thrift/gen/thriftpb/`. To regenerate:
+
+```bash
+make thrift      # Go server stubs
+make thrift-py   # Python client stubs → clients/python/
+```
+
+**Transport and protocol — binary over TCP.** The server uses Thrift's compact **binary protocol over a raw TCP socket** (buffered transport), which is fast and space-efficient for internal, service-to-service RPC. This is a deliberate choice with a trade-off: a raw TCP socket is **not reachable from a browser**, and Thrift's JavaScript client speaks `TJSONProtocol` over HTTP rather than the RealWorld JSON contract. Browser and REST consumers are therefore served by the HTTP adapter; Thrift is positioned as the internal RPC layer where its efficiency and typed contract are the advantage. The client must match the server's transport/protocol pairing exactly.
+
+**Transport security.** The Thrift server requires the same mutual TLS as the gRPC server, sharing a single `tls.Config` and the `certs/` chain (see [Generating dev TLS certificates](#generating-dev-tls-certificates)).
+
+**Structured errors.** The IDL declares one exception — `exception ValidationError { map<string, list<string>> errors }`. The adapter's `domainErr` helper (`internal/adapters/in/thrift/errors.go`) folds both `*domain.ValidationError` and `*domain.DuplicateError` into it, keyed by field name (matching the RealWorld 422 shape); any other error is returned as a generic `TApplicationException`. Unlike the gRPC adapter — which maps each domain error to a distinct status code — Thrift can only surface *declared* exceptions structurally, so this folding is deliberate; distinguishing further error types would mean adding exceptions to the IDL.
+
+**Polyglot client.** A Python client lives in `clients/python/` — generated stubs plus a hand-written `client.py` that registers a user over the same binary/buffered/mTLS stack. This is the cross-language interop demonstration that is Thrift's core strength: one IDL, a Go server, and a Python client. (Note that Thrift keeps the IDL method name verbatim per language, so the Python call is `client.registerUser(...)` versus Go's `RegisterUser`.)
+
 ## Running the app
 
 **Prerequisites:** Docker, Go 1.21+
@@ -188,28 +211,21 @@ The suite covers all gRPC endpoints across ten test files:
 
 ### Generating dev TLS certificates
 
-The gRPC server requires mTLS. Self-signed certificates for local development are committed to `certs/` (public certs only — private keys are in `.gitignore`). If you need to regenerate them, run the following from the repo root:
+The gRPC and Thrift servers require mTLS. Self-signed certificates for local development are committed to `certs/` (public certs only — private keys are in `.gitignore`). To regenerate the full chain (CA, server, client), run the script from the repo root:
 
 ```bash
-# CA
-openssl genrsa -out certs/ca.key 4096
-openssl req -new -x509 -days 3650 -key certs/ca.key -out certs/ca.crt -subj "/CN=dev-ca"
-
-# Server (SAN required — Go 1.15+ rejects CN-only certs)
-openssl genrsa -out certs/server.key 4096
-openssl req -new -key certs/server.key -out certs/server.csr -subj "/CN=localhost"
-openssl x509 -req -days 825 -in certs/server.csr \
-  -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-  -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1") \
-  -out certs/server.crt
-
-# Client
-openssl genrsa -out certs/client.key 4096
-openssl req -new -key certs/client.key -out certs/client.csr -subj "/CN=dev-client"
-openssl x509 -req -days 825 -in certs/client.csr \
-  -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial \
-  -out certs/client.crt
+./certs/gen-certs.sh
 ```
+
+It writes `ca.crt`, `server.crt`, and `client.crt` (plus their `.key` files) into `certs/` and verifies the chain. After regenerating, **restart any running server** so it reloads the new certs.
+
+**Note on X.509 extensions.** An earlier version of these certs was generated without `keyUsage` / `extendedKeyUsage` extensions (and a CA with no `keyUsage` at all). Go's TLS verifier and `openssl s_client` accept such minimal certs, so the gRPC server worked fine — but **strict RFC 5280 verifiers reject them**. The Thrift Python client (Python 3.14 + OpenSSL 3.6) failed its TLS handshake with `certificate verify failed: CA cert does not include key usage extension`, which surfaced misleadingly as a `bad record MAC` error in the Go server logs. The fix — baked into `gen-certs.sh` — is to issue standards-compliant certs:
+
+| Cert | Required extensions |
+|---|---|
+| CA | `basicConstraints=CA:TRUE`, `keyUsage=keyCertSign,cRLSign` |
+| Server | `keyUsage=digitalSignature,keyEncipherment`, `extendedKeyUsage=serverAuth`, `subjectAltName=DNS:localhost,IP:127.0.0.1` |
+| Client | `keyUsage=digitalSignature`, `extendedKeyUsage=clientAuth` |
 
 These certs are for local development only. They are self-signed and trusted only within this dev environment. In production, TLS is handled at the AWS infrastructure layer using certificates managed outside the codebase.
 

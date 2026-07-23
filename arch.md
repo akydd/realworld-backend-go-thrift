@@ -8,7 +8,7 @@ A [RealWorld](https://github.com/gothinkster/realworld) backend implementation i
 
 ```
 realworld-backend-go/
-├── cmd/server/server.go              # Entry point — wires domain, HTTP, and gRPC
+├── cmd/server/server.go              # Entry point — wires domain, HTTP, gRPC, and Thrift
 ├── api/proto/                        # Protobuf service definitions
 │   ├── user.proto
 │   ├── article.proto
@@ -18,6 +18,9 @@ realworld-backend-go/
 │   ├── buf.yaml                      # buf build config
 │   ├── buf.lock
 │   └── gen/pb/                       # Generated Go stubs (committed)
+├── api/thrift/                       # Thrift IDL (internal RPC)
+│   ├── user.thrift                   # UserService (registerUser)
+│   └── gen/thriftpb/                 # Generated Go stubs (committed)
 ├── internal/
 │   ├── domain/                       # Business logic (no external dependencies)
 │   │   ├── models.go                 # Core data models
@@ -32,14 +35,18 @@ realworld-backend-go/
 │       │   ├── webserver/            # Inbound: HTTP
 │       │   │   ├── server.go         # Gorilla Mux router setup
 │       │   │   └── handlers.go       # HTTP request/response handling
-│       │   └── grpc/                 # Inbound: gRPC
-│       │       ├── server.go         # Registers all service servers + reflection
-│       │       ├── middleware.go     # AuthInterceptor + StreamAuthInterceptor (NoAuth/OptionalAuth/MandatoryAuth)
-│       │       ├── user.go           # UserServer
-│       │       ├── article.go        # ArticleServer
-│       │       ├── profile.go        # ProfileServer
-│       │       ├── comment.go        # CommentServer
-│       │       └── tag.go            # TagServer
+│       │   ├── grpc/                 # Inbound: gRPC
+│       │   │   ├── server.go         # Registers all service servers + reflection
+│       │   │   ├── middleware.go     # AuthInterceptor + StreamAuthInterceptor (NoAuth/OptionalAuth/MandatoryAuth)
+│       │   │   ├── user.go           # UserServer
+│       │   │   ├── article.go        # ArticleServer
+│       │   │   ├── profile.go        # ProfileServer
+│       │   │   ├── comment.go        # CommentServer
+│       │   │   └── tag.go            # TagServer
+│       │   └── thrift/               # Inbound: Thrift (binary/TCP, mTLS)
+│       │       ├── server.go         # TSimpleServer + processor setup
+│       │       ├── user.go           # UserServer (registerUser)
+│       │       └── errors.go         # domainErr → thriftpb.ValidationError
 │       └── out/db/                   # Outbound: PostgreSQL
 │           ├── postgres.go           # sqlx-based repository
 │           └── migrations/
@@ -63,13 +70,18 @@ realworld-backend-go/
 │   ├── pagination_test.go
 │   ├── errors_test.go
 │   └── streaming_test.go             # LiveArticleFeed, LiveCommentFeed, slug isolation
+├── clients/python/                   # Polyglot Thrift client (cross-language interop demo)
+│   ├── client.py                     # Registers a user over binary/TCP + mTLS
+│   ├── requirements.txt              # apache-thrift runtime
+│   └── gen/thriftpb/                 # Generated Python stubs (committed)
 ├── certs/                            # Dev TLS certificates (public .crt only; .key in .gitignore)
+│   ├── gen-certs.sh                  # Regenerates the CA + server/client chain (compliant extensions)
 │   ├── ca.crt                        # Self-signed CA certificate
 │   ├── server.crt                    # Server certificate (signed by CA, SAN: localhost/127.0.0.1)
 │   └── client.crt                    # Client certificate (signed by CA)
 ├── compose.yaml                      # Docker Compose (prod DB)
 ├── compose.test.yaml                 # Docker Compose (test DB)
-├── Makefile                          # make int-tests / make int-tests-grpc
+├── Makefile                          # make int-tests / int-tests-grpc / thrift / thrift-py
 ├── .env                              # Production environment config
 └── .env_test                         # Test environment config
 ```
@@ -142,9 +154,9 @@ Handles the HTTP protocol layer:
 
 Runs on a separate port (`GRPC_PORT`) alongside the HTTP server. Both servers are started concurrently from `cmd/server/server.go`; both delegate to the same domain controller instances, so there is no business logic duplication.
 
-**Transport security** — the gRPC server requires mTLS. `setupTLSCreds()` (in `cmd/server/server.go`) reads the server certificate, private key, and CA certificate from the file paths in `GRPC_TLS_CERT`, `GRPC_TLS_KEY`, and `GRPC_TLS_CA`. It builds a `tls.Config` with `ClientAuth: tls.RequireAndVerifyClientCert`, `MinVersion: tls.VersionTLS13`, and passes the resulting credentials to `grpc.NewServer` via `grpc.Creds(creds)`. Clients must present a certificate signed by the same CA; any connection without a valid client cert is rejected at the TLS handshake before reaching any interceptor or handler.
+**Transport security** — both the gRPC and Thrift servers require mTLS, and they share a single `tls.Config`. `createTlsConfig()` (in `cmd/server/server.go`) reads the server certificate, private key, and CA certificate from the file paths in `GRPC_TLS_CERT`, `GRPC_TLS_KEY`, and `GRPC_TLS_CA`, and builds a `tls.Config` with `ClientAuth: tls.RequireAndVerifyClientCert`, `MinVersion: tls.VersionTLS13`. The gRPC server wraps it via `setupTLSCreds()` → `grpc.Creds(creds)`; the Thrift server receives the same `*tls.Config` directly through `NewThriftServer`. Clients on either transport must present a certificate signed by the same CA; any connection without a valid client cert is rejected at the TLS handshake before reaching any interceptor or handler.
 
-In local development the certs are self-signed files in `certs/`. In production, the PEM strings are stored in AWS Secrets Manager and injected at container startup.
+In local development the certs are self-signed files in `certs/`, generated by `certs/gen-certs.sh` (see the readme). Both inbound adapters trust the same CA and share the `certs/` chain. The dev certs must carry standards-compliant X.509 extensions (`keyUsage` on the CA, `keyUsage`/`extendedKeyUsage` on the leaves) — strict verifiers such as Python's `ssl` module reject minimal certs even though Go's verifier accepts them. In production, the PEM strings are stored in AWS Secrets Manager and injected at container startup.
 
 **`server.go`** — `NewGrpcServer` registers all five service servers (`UserServiceServer`, `ArticleServiceServer`, `ProfileServiceServer`, `CommentServiceServer`, `TagServiceServer`) and enables gRPC reflection so tools like `grpcurl` can discover the API at runtime.
 
@@ -180,6 +192,31 @@ Mandatory-auth handlers read the ID with `ctx.Value(UserIDKey).(int)`. Optional-
 - `articleToProto` / `articleListItemToProto` — convert domain `Article` to the single-article and list-item proto shapes respectively.
 - `articleAuthorToProto` — converts a domain `Profile` to `ArticleAuthor`.
 - `articlesResponse` — builds the `ArticlesResponse` (list + total count) from a domain `ArticleList`.
+
+### Inbound Adapter — Thrift (`internal/adapters/in/thrift/`)
+
+An Apache Thrift RPC adapter, added as a third inbound transport alongside HTTP and gRPC. It follows the same convention the gRPC adapter established and delegates to the same domain controllers, so there is no business logic duplication. It runs on its own port (`THRIFT_PORT`), started concurrently from `cmd/server/server.go`.
+
+**Intended consumer** — internal, service-to-service RPC. It uses the compact, fast **binary protocol over a raw TCP socket**, which is ideal for Go/polyglot backend clients but *not* reachable from a browser (browsers cannot open raw TCP sockets, and the Thrift JS client speaks `TJSONProtocol`). Browser/REST consumers continue to use the spec-compliant HTTP adapter; Thrift is deliberately the internal RPC layer.
+
+**IDL & code generation** — the service is defined in `api/thrift/user.thrift` (namespaces `go thriftpb` and `py thriftpb`). Generated Go stubs are committed to `api/thrift/gen/thriftpb/` (mirroring the committed proto stubs). Regenerate with:
+
+```bash
+make thrift      # Go stubs → api/thrift/gen/thriftpb/
+make thrift-py   # Python client stubs → clients/python/gen/thriftpb/
+```
+
+Both targets strip the generated `*-remote` CLI helper (a standalone tool with a broken import that is not needed).
+
+**`server.go`** — `NewThriftServer(addr, userService, tlsCfg)` builds the transport stack: a `TSSLServerSocket` when a `*tls.Config` is supplied (the mTLS path used in this project) or a plain `TServerSocket` otherwise, wrapped with a buffered transport factory and a binary protocol factory, served by a `TSimpleServer`. The protocol/transport pairing (**buffered transport + binary protocol**) is a contract the client must match exactly. Currently hosts a single-service processor (`NewUserServiceProcessor`); adding further services would use a `TMultiplexedProcessor`.
+
+**`user.go`** — `UserServer` implements the generated `thriftpb.UserService` interface. It defines a narrow local `userService` interface (satisfied by the domain `UserController`) and maps between the generated request/response types and domain models. `RegisterUser` is the only method implemented so far; it requires no authentication (like its gRPC counterpart).
+
+**`errors.go`** — `domainErr` translates domain errors into the exceptions declared in the IDL. The IDL declares a single `exception ValidationError { map<string, list<string>> errors }`, so both `*domain.ValidationError` and `*domain.DuplicateError` are surfaced through it, keyed by field name (matching the RealWorld 422 shape). Any other error is returned unchanged and serialized by the processor as a generic `TApplicationException`. Unlike the gRPC adapter — which maps each domain error to a distinct status code — Thrift can only surface *declared* exceptions structurally, so this folding is deliberate; distinguishing further error types would require adding exceptions to the IDL.
+
+**Transport security** — shares the same mTLS `tls.Config` and `certs/` chain as the gRPC server (see **Transport security** under the gRPC section).
+
+**Polyglot client** — a Python client lives in `clients/python/` (generated stubs plus a hand-written `client.py`), demonstrating cross-language interop over the same IDL. It connects with a matching binary/buffered/mTLS stack. Note that Thrift keeps the IDL method name verbatim per language, so the Python call is `client.registerUser(...)` (camelCase) versus Go's `RegisterUser`.
 
 ### Outbound Adapter — Database (`internal/adapters/out/db/`)
 PostgreSQL persistence via `sqlx`:
@@ -287,6 +324,7 @@ Loaded from `.env` / `.env_test` via `godotenv`:
 |----------|---------|-------|
 | `SERVER_PORT` | 8090 | HTTP server port (test: 8097) |
 | `GRPC_PORT` | 8099 | gRPC server port (test: 8098); required, server exits if missing |
+| `THRIFT_PORT` | 8100 | Thrift server port (test: 8101) |
 | `JWT_SECRET` | — | HMAC signing key for JWT tokens |
 | `DB_HOST` | localhost | PostgreSQL host |
 | `DB_PORT` | 8095 | PostgreSQL port (test: 8096) |

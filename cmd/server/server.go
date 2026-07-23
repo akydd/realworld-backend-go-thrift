@@ -118,7 +118,7 @@ func main() {
 	}()
 
 	// Thrift http server!
-	thriftPort := os.Getenv("THRIFT_HTTP_PORT")
+	thriftPort := os.Getenv("THRIFT_PORT")
 	thriftAddr := fmt.Sprintf("localhost:%s", thriftPort)
 
 	userThriftService := ithrift.NewUserServer(userController)
