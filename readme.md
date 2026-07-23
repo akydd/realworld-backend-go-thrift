@@ -166,6 +166,27 @@ Stop the server with Ctrl+C. To also stop the database:
 docker compose down
 ```
 
+## Running the Python Thrift client
+
+The Python client registers a user against the running Thrift server, demonstrating cross-language interop over the shared IDL.
+
+**Prerequisites:** Python 3, the running server (`make start`), and the dev TLS certificates (see [Generating dev TLS certificates](#generating-dev-tls-certificates)). The generated Python stubs are committed to `clients/python/gen/`, so you do not need to run `make thrift-py` first.
+
+From the repo root:
+
+```bash
+cd clients/python
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python client.py
+```
+
+On success it prints the registered user returned by the server. Running it again with the same details exercises the error path — the server's `DuplicateError` is surfaced as the IDL's `ValidationError` exception and printed as a validation error.
+
+The client connects over mTLS on `localhost:8100` (the production `THRIFT_PORT`) using the certs in `certs/`. It must use the same transport/protocol as the server (buffered transport + binary protocol); both are already configured in `client.py`.
+
 ## Running the integration tests
 
 **Prerequisites:** Docker, Go 1.21+, [Hurl](https://hurl.dev), and the [realworld](https://github.com/gothinkster/realworld) repo checked out as a sibling directory (`../realworld`).
